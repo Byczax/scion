@@ -1,0 +1,99 @@
+name: SCION CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+
+  # ---------------- BUILD ----------------
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        target: [build, build-dev]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: ${{ runner.os }}-bazel-${{ github.ref }}
+          restore-keys: |
+            ${{ runner.os }}-bazel-
+      - uses: bazelbuild/setup-bazelisk@v3
+      - run: make ${{ matrix.target }}
+
+  # ---------------- TEST ----------------
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        target: [test, test-integration]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: ${{ runner.os }}-bazel-${{ github.ref }}
+      - uses: bazelbuild/setup-bazelisk@v3
+      - run: make ${{ matrix.target }}
+
+  # ---------------- LINT ----------------
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        target: [lint-go, lint-bazel, lint-protobuf, lint-openapi, lint-doc]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: ${{ runner.os }}-bazel-${{ github.ref }}
+      - uses: bazelbuild/setup-bazelisk@v3
+      - run: sudo apt-get update && sudo apt-get install -y docker.io
+      - run: make ${{ matrix.target }}
+
+  # ---------------- DIST ----------------
+  dist:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        target: [dist-deb, dist-rpm, dist-openwrt, dist-openwrt-testing]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: ${{ runner.os }}-bazel-${{ github.ref }}
+      - uses: bazelbuild/setup-bazelisk@v3
+      - run: make ${{ matrix.target }}
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: installables/*
+
+  # ---------------- DOCKER ----------------
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: ${{ runner.os }}-bazel-${{ github.ref }}
+      - uses: bazelbuild/setup-bazelisk@v3
+      - run: sudo apt-get update && sudo apt-get install -y docker.io
+      - run: sudo systemctl start docker
+      - run: make docker-images
