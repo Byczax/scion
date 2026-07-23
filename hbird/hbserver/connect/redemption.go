@@ -90,10 +90,10 @@ func (s *HBirdServer) redeem(_ context.Context,
 			return nil, err
 		}
 
-		low := int(redReq.RedInfo.StartTime) % s.Icm.NUnitIntervals
-		high := int(dur.Seconds())
+		// A ResID ("color") is unique among reservations active at the same time;
+		// it is held until this reservation expires, then reused.
 		expiry := resInfo.StartTime.Add(resInfo.Duration)
-		resID, err := s.Icm.AssignColor(low, high, expiry)
+		resID, err := s.Icm.AssignColor(expiry)
 		if err != nil {
 			return nil, err
 		}
