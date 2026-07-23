@@ -18,6 +18,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
+	"time"
 )
 
 // Node stores the used colors in colorBits.
@@ -40,20 +42,42 @@ func (n *Node) markUsedColor(color uint32) {
 	n.colorBits[chunkIdx] |= 1 << (wordSize - 1 - bitIdx)
 }
 
+// colorReservation records a single assigned color together with the interval it
+// occupies and the instant at which it expires. It is kept so that expired colors
+// can be released and reused.
+type colorReservation struct {
+	color  uint32
+	low    int
+	high   int
+	expiry time.Time
+}
+
 // IntervalColorMap allows marking and looking up the colors used in an interval, in a chunked bitvector,
 // allowing direct lookup of the first free color.
 type IntervalColorMap struct {
+	// mu guards all mutable state below; AssignColor may be called concurrently
+	// from multiple redemption handlers.
+	mu             sync.Mutex
 	nodes          []Node
 	NUnitIntervals int
+	// reservations holds every currently-active color assignment so that expired
+	// ones can be swept and their colors freed for reuse.
+	reservations []colorReservation
+	// maxColors is the exclusive upper bound on assignable color values, i.e.
+	// 1<<resIDBits. Colors grow into fresh chunks up to this bound.
+	maxColors uint32
 }
 
-// NewIntervalColorMap initializes a new IntervalColorMap
-func NewIntervalColorMap(nUnitIntervals int) *IntervalColorMap {
+// NewIntervalColorMap initializes a new IntervalColorMap. resIDBits is the number
+// of bits available to encode a color (ResID) on the wire; colors range over
+// [0, 1<<resIDBits).
+func NewIntervalColorMap(nUnitIntervals, resIDBits int) *IntervalColorMap {
 	nInnerNodes := nextPowerOfTwo(nUnitIntervals) - 1
 	nodes := make([]Node, nInnerNodes+nUnitIntervals)
 	return &IntervalColorMap{
 		nodes:          nodes,
 		NUnitIntervals: nUnitIntervals,
+		maxColors:      uint32(1) << resIDBits,
 	}
 }
 
@@ -133,8 +157,16 @@ func (icm *IntervalColorMap) markAncestors(index int, color uint32) error {
 }
 
 // AssignColor assigns and returns the first free color in the interval low, high;
-// this corresponds to the interval (start_time, expiration_time).
-func (icm *IntervalColorMap) AssignColor(low, high int) (uint32, error) {
+// this corresponds to the interval (start_time, expiration_time). expiry is the
+// instant at which the reservation ends; once passed the color is released and
+// may be reused by a later assignment. It is safe for concurrent use.
+func (icm *IntervalColorMap) AssignColor(low, high int, expiry time.Time) (uint32, error) {
+	icm.mu.Lock()
+	defer icm.mu.Unlock()
+
+	// Free any expired colors before searching, so their bits become reusable.
+	icm.sweepExpired(time.Now())
+
 	color, err := icm.firstFreeColor(low, high)
 	if err != nil {
 		return 0, err
@@ -142,7 +174,44 @@ func (icm *IntervalColorMap) AssignColor(low, high int) (uint32, error) {
 	if err := icm.markUsedColor(color, low, high); err != nil {
 		return 0, err
 	}
+	icm.reservations = append(icm.reservations, colorReservation{
+		color:  color,
+		low:    low,
+		high:   high,
+		expiry: expiry,
+	})
 	return color, nil
+}
+
+// sweepExpired drops every reservation whose expiry is at or before now and, if
+// any were dropped, rebuilds the bit tree from the remaining active reservations.
+// Rebuilding is used instead of clearing individual bits because colors are shared
+// across overlapping intervals (subtree/ancestor marking), so a plain bit-clear
+// could wrongly free a color still held by another active reservation.
+// Caller must hold icm.mu.
+func (icm *IntervalColorMap) sweepExpired(now time.Time) {
+	kept := icm.reservations[:0]
+	removed := false
+	for _, r := range icm.reservations {
+		if !r.expiry.After(now) {
+			removed = true
+			continue
+		}
+		kept = append(kept, r)
+	}
+	if !removed {
+		return
+	}
+	icm.reservations = kept
+
+	// Clear all bits and re-mark the still-active reservations.
+	for i := range icm.nodes {
+		icm.nodes[i].colorBits = nil
+	}
+	for _, r := range icm.reservations {
+		// Ignore errors: these intervals were valid when first assigned.
+		_ = icm.markUsedColor(r.color, r.low, r.high)
+	}
 }
 
 // firstFreeColor is a helper function calling an iterator over the combined chunked data.
@@ -173,11 +242,14 @@ func (icm *IntervalColorMap) firstFreeColor(low, high int) (uint32, error) {
 		}
 	}
 	// Now use firstFreeFromChunkIter to pick the first free color bit
-	return firstFreeFromChunkIter(chunks)
+	return firstFreeFromChunkIter(chunks, icm.maxColors)
 }
 
-// firstFreeFromChunkIter scans the slice for the first chunk != MAX.
-func firstFreeFromChunkIter(chunks []uint64) (uint32, error) {
+// firstFreeFromChunkIter returns the first free color in chunks, i.e. the first
+// zero bit. When every currently-allocated chunk is full it grows into a fresh
+// chunk by returning len(chunks)*wordSize, provided that stays below maxColors.
+// It fails only once the full [0, maxColors) color space is exhausted.
+func firstFreeFromChunkIter(chunks []uint64, maxColors uint32) (uint32, error) {
 	// We look for the first chunk which is not all 1 bits
 	allOnes := ^uint64(0)
 	for i, val := range chunks {
@@ -187,13 +259,21 @@ func firstFreeFromChunkIter(chunks []uint64) (uint32, error) {
 				mask := uint64(1) << (wordSize - 1 - bitIdx)
 				if (val & mask) == 0 {
 					// The color is i*wordSize + bitIdx
-					return uint32(i)*wordSize + bitIdx, nil
+					color := uint32(i)*wordSize + bitIdx
+					if color >= maxColors {
+						return 0, errors.New("all bits used, no free color found")
+					}
+					return color, nil
 				}
 			}
 		}
 	}
-	// If none found, we fail
-	return 0, errors.New("all bits used, no free color found")
+	// Every allocated chunk is full: the next free color lives in a new chunk.
+	next := uint32(len(chunks)) * wordSize
+	if next >= maxColors {
+		return 0, errors.New("all bits used, no free color found")
+	}
+	return next, nil
 }
 
 // NodeIdxIter iterates over the indices in the tree covering [low..high].

@@ -92,7 +92,8 @@ func (s *HBirdServer) redeem(_ context.Context,
 
 		low := int(redReq.RedInfo.StartTime) % s.Icm.NUnitIntervals
 		high := int(dur.Seconds())
-		resID, err := s.Icm.AssignColor(low, high)
+		expiry := resInfo.StartTime.Add(resInfo.Duration)
+		resID, err := s.Icm.AssignColor(low, high, expiry)
 		if err != nil {
 			return nil, err
 		}

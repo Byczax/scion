@@ -18,11 +18,21 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
+
+// farFuture is an expiry far enough ahead that AssignColor never treats a color
+// as expired during a test.
+var farFuture = time.Now().Add(24 * time.Hour)
+
+// testResIDBits is the wire ResID width used across the tests; matches the
+// production RESID_BITS and gives a color space large enough that growth tests
+// never hit the bound unless they mean to.
+const testResIDBits = 22
 
 // TestIntervalColorMapNodesForInterval test if the correct nodes of the IntervalColorMap cover the range
 func TestIntervalColorMapNodesForInterval(t *testing.T) {
-	icm := NewIntervalColorMap(8)
+	icm := NewIntervalColorMap(8, testResIDBits)
 
 	cases := []struct {
 		name        string
@@ -155,7 +165,7 @@ func TestColorAssignment(t *testing.T) {
 		{3, 5},
 	}
 	var assignedColors []uint32
-	colorTree := NewIntervalColorMap(7)
+	colorTree := NewIntervalColorMap(7, testResIDBits)
 
 	for _, itv := range intervals {
 		c, err := colorTree.firstFreeColor(itv.low, itv.high)
@@ -178,10 +188,10 @@ func TestColorAssignment(t *testing.T) {
 		}
 	}
 
-	colorTree = NewIntervalColorMap(7)
+	colorTree = NewIntervalColorMap(7, testResIDBits)
 	assignedColors = []uint32{}
 	for _, itv := range intervals {
-		c, err := colorTree.AssignColor(itv.low, itv.high)
+		c, err := colorTree.AssignColor(itv.low, itv.high, farFuture)
 		if err != nil {
 			t.Fatalf("AssignColor(%d..%d) failed: %v", itv.low, itv.high, err)
 		}
@@ -305,10 +315,14 @@ func TestColorAssignment(t *testing.T) {
 				}
 			})
 		case "allUsed":
-			colorTree.nodes[7].colorBits[0] = ^uint64(0)
-			colorTree.nodes[7].colorBits[1] = ^uint64(0)
+			// Bound the color space to exactly two chunks (2*wordSize colors) so
+			// that filling both chunks truly exhausts it and no fresh chunk can grow.
+			smallTree := NewIntervalColorMap(7, 7) // maxColors = 1<<7 = 128 = 2*wordSize
+			smallTree.nodes[7].markUsedColor(2*wordSize - 1)
+			smallTree.nodes[7].colorBits[0] = ^uint64(0)
+			smallTree.nodes[7].colorBits[1] = ^uint64(0)
 			t.Run(tc.name, func(t *testing.T) {
-				_, err := colorTree.firstFreeColor(tc.low, tc.low)
+				_, err := smallTree.firstFreeColor(tc.low, tc.low)
 				if err == nil {
 					t.Fatalf("firstFreeColor(%d, %d) does not error: %v, expected: %v",
 						tc.high+1, tc.color, err, tc.wantError)
@@ -319,8 +333,8 @@ func TestColorAssignment(t *testing.T) {
 			})
 		case "invalidAssignColorInterval":
 			t.Run(tc.name, func(t *testing.T) {
-				icm := NewIntervalColorMap(2)
-				_, err := icm.AssignColor(tc.low, tc.high)
+				icm := NewIntervalColorMap(2, testResIDBits)
+				_, err := icm.AssignColor(tc.low, tc.high, farFuture)
 				if err == nil {
 					t.Fatalf("AssignColor(%d, %d) does not error: %v, expected: %v",
 						tc.high+1, tc.color, err, tc.wantError)
@@ -331,7 +345,7 @@ func TestColorAssignment(t *testing.T) {
 			})
 		case "invalidIdxIterator":
 			t.Run(tc.name, func(t *testing.T) {
-				icm := NewIntervalColorMap(1)
+				icm := NewIntervalColorMap(1, testResIDBits)
 				iter := NewNodeIdxIter(icm, tc.low, tc.high)
 				idx, ok := iter.Next()
 				if ok {
@@ -346,7 +360,7 @@ func TestColorAssignment(t *testing.T) {
 			})
 		case "invalidNodeIterator":
 			t.Run(tc.name, func(t *testing.T) {
-				icm := NewIntervalColorMap(1)
+				icm := NewIntervalColorMap(1, testResIDBits)
 				iter := NewNodeIter(icm, tc.low, tc.high)
 				idx, ok := iter.Next()
 				if ok {
@@ -360,5 +374,29 @@ func TestColorAssignment(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestChunkGrowthAndBound checks that colors grow past a single 64-bit chunk and
+// that assignment fails only once the whole [0, 1<<resIDBits) space is exhausted.
+func TestChunkGrowthAndBound(t *testing.T) {
+	// resIDBits = 7 => maxColors = 128, exactly two chunks.
+	const resIDBits = 7
+	const maxColors = 1 << resIDBits
+	icm := NewIntervalColorMap(4, resIDBits)
+
+	for i := 0; i < maxColors; i++ {
+		c, err := icm.AssignColor(0, 0, farFuture)
+		if err != nil {
+			t.Fatalf("AssignColor #%d failed unexpectedly: %v", i, err)
+		}
+		if c != uint32(i) {
+			t.Fatalf("AssignColor #%d: got color %d, want %d", i, c, i)
+		}
+	}
+	// Color 64 must have been reachable (proves growth past one chunk).
+	// The next assignment must fail: the space is full.
+	if _, err := icm.AssignColor(0, 0, farFuture); err == nil {
+		t.Fatalf("AssignColor past maxColors=%d did not error", maxColors)
 	}
 }
