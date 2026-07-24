@@ -28,6 +28,11 @@ const (
 	// Wire format constants
 	RESID_BITS       = 22
 	MAX_DURATION_SEC = math.MaxUint16
+
+	// HORIZON_SLOTS is the color tree's window size in one-second slots. It must
+	// exceed MAX_DURATION_SEC so any reservation fits within the window; 65536
+	// gives an ~18.2h horizon at one-second granularity.
+	HORIZON_SLOTS = 65536
 )
 
 type HBirdServer struct {
@@ -90,10 +95,13 @@ func (s *HBirdServer) redeem(_ context.Context,
 			return nil, err
 		}
 
-		// A ResID ("color") is unique among reservations active at the same time;
-		// it is held until this reservation expires, then reused.
+		// Map the reservation onto absolute one-second time slots: it occupies
+		// [StartTime, StartTime+Duration]. The color tree keeps this ResID unique
+		// among reservations overlapping this span and reuses it once expired.
+		absLow := int(redReq.RedInfo.StartTime)
+		absHigh := absLow + int(dur.Seconds())
 		expiry := resInfo.StartTime.Add(resInfo.Duration)
-		resID, err := s.Icm.AssignColor(expiry)
+		resID, err := s.Icm.AssignColor(absLow, absHigh, expiry)
 		if err != nil {
 			return nil, err
 		}

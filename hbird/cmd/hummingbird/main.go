@@ -202,7 +202,7 @@ func realMain(ctx context.Context) error {
 
 	// Create the service
 	svc := hbirdconnect.NewHummingbirdKeyDerivationService(masterKey)
-	icm := hb.NewIntervalColorMap(hbirdconnect.RESID_BITS)
+	icm := hb.NewIntervalColorMap(hbirdconnect.HORIZON_SLOTS, hbirdconnect.RESID_BITS)
 	hbs := &hbirdgrpc.HBirdServer{Topo: topo, HbService: svc, Icm: icm}
 	connectSrv := &hbirdconnect.HBirdServer{Topo: topo, HbService: svc, Icm: icm}
 
